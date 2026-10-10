@@ -4,6 +4,26 @@ import os
 # 禁用rembg的后端检查警告
 os.environ['REMBG_DISABLE_CHECK'] = '1'
 
+# 打包模式：使用exe内置的模型目录（_MEIPASS/models/u2net/u2net.onnx），实现离线运行背景消除
+if getattr(sys, 'frozen', False):
+    os.environ.setdefault('REMBG_HOME', sys._MEIPASS)
+
+# 尝试导入rembg（深度学习背景消除）
+# 注意：必须在导入PyQt5之前导入rembg/onnxruntime，否则DLL加载顺序冲突会导致段错误
+REMBG_AVAILABLE = False
+try:
+    # 检查onnxruntime是否可用
+    import onnxruntime
+    print(f"onnxruntime版本: {onnxruntime.__version__}")
+
+    from rembg import remove, new_session
+    REMBG_AVAILABLE = True
+    print("rembg深度学习库加载成功")
+except Exception as e:
+    REMBG_AVAILABLE = False
+    print(f"警告：rembg不可用，深度学习背景消除功能已禁用")
+    print(f"错误详情: {str(e)}")
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
                              QMessageBox, QGroupBox, QProgressBar, QCheckBox)
@@ -14,21 +34,6 @@ import numpy as np
 from PIL import Image
 import img2pdf
 from io import BytesIO
-
-# 尝试导入rembg（深度学习背景消除）
-REMBG_AVAILABLE = False
-try:
-    # 检查onnxruntime是否可用
-    import onnxruntime
-    print(f"onnxruntime版本: {onnxruntime.__version__}")
-
-    from rembg import remove
-    REMBG_AVAILABLE = True
-    print("rembg深度学习库加载成功")
-except Exception as e:
-    REMBG_AVAILABLE = False
-    print(f"警告：rembg不可用，深度学习背景消除功能已禁用")
-    print(f"错误详情: {str(e)}")
 
 
 class ImageLabel(QLabel):
@@ -213,6 +218,15 @@ class IDCardScanner(QMainWindow):
         self.remove_bg_checkbox.setChecked(False)
         self.remove_bg_checkbox.setStyleSheet("font-size: 12px; color: #666;")
         options_layout.addWidget(self.remove_bg_checkbox)
+
+        self.print_scale_checkbox = QCheckBox('打印尺寸补偿（打印出来偏小时勾选）')
+        self.print_scale_checkbox.setChecked(False)
+        self.print_scale_checkbox.setStyleSheet("font-size: 12px; color: #666;")
+        self.print_scale_checkbox.setToolTip(
+            '打印机按"适合可打印区域"缩小时勾选此项。\n'
+            '勾选后卡片在文档中放大1.041倍，打印后恰好为实物尺寸85.45mm。\n'
+            '打印时选"实际大小(100%)"则不需要勾选。')
+        options_layout.addWidget(self.print_scale_checkbox)
 
         options_layout.addStretch()
         main_layout.addLayout(options_layout)
@@ -480,8 +494,10 @@ class IDCardScanner(QMainWindow):
             pil_image = Image.fromarray(image_rgb)
 
             # 使用rembg进行背景消除（基于U²-Net深度学习模型）
-            # u2net模型对证件照效果很好
-            output = remove(pil_image, model_name='u2net')
+            # 会话只创建一次并复用，避免每次重新加载模型
+            if not getattr(self, '_rembg_session', None):
+                self._rembg_session = new_session('u2net')
+            output = remove(pil_image, session=self._rembg_session)
 
             # 转换回OpenCV格式
             output_array = np.array(output)
@@ -548,6 +564,27 @@ class IDCardScanner(QMainWindow):
 
         return image
 
+    def apply_rounded_corners(self, image, radius_mm=3.18):
+        """给卡片添加标准圆角（身份证/银行卡标准3.18mm），圆角外区域填充白色"""
+        height, width = image.shape[:2]
+        # 按卡片实际尺寸比例计算圆角半径（卡片宽度对应实测85.45mm）
+        radius = max(1, int(round(width * radius_mm / 85.45)))
+
+        # 4倍超采样绘制圆角蒙版，缩小后获得抗锯齿的平滑边缘
+        scale = 4
+        w4, h4, r4 = width * scale, height * scale, radius * scale
+        mask = np.zeros((h4, w4), dtype=np.uint8)
+        cv2.rectangle(mask, (r4, 0), (w4 - r4, h4), 255, -1)
+        cv2.rectangle(mask, (0, r4), (w4, h4 - r4), 255, -1)
+        for cx, cy in [(r4, r4), (w4 - r4, r4), (r4, h4 - r4), (w4 - r4, h4 - r4)]:
+            cv2.circle(mask, (cx, cy), r4, 255, -1)
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_AREA)
+
+        # 圆角外区域填充白色（与A4白底一致）
+        alpha = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+        result = image.astype(np.float32) * alpha + 255.0 * (1 - alpha)
+        return result.astype(np.uint8)
+
     def generate_pdf(self):
         """生成PDF"""
         # 检查是否上传了图片
@@ -603,13 +640,23 @@ class IDCardScanner(QMainWindow):
             a4_width = 2480
             a4_height = 3508
 
-            # 身份证标准尺寸 (像素, 300 DPI)
-            id_width = 1012
-            id_height = 638
+            # 身份证实际尺寸 (像素, 300 DPI)：按游标卡尺实测 85.45mm x 53.95mm
+            id_width = 1009   # 85.45mm @300DPI
+            id_height = 637   # 53.95mm @300DPI
+
+            # 打印尺寸补偿：打印机按"适合可打印区域"缩小时勾选，
+            # 按实测打印误差放大（82.11->85.45, 51.80->53.95），打印后与实物等大
+            if self.print_scale_checkbox.isChecked():
+                id_width = int(round(id_width * 85.45 / 82.11))
+                id_height = int(round(id_height * 53.95 / 51.80))
 
             # 调整图片尺寸
             front_resized = cv2.resize(front_processed, (id_width, id_height))
             back_resized = cv2.resize(back_processed, (id_width, id_height))
+
+            # 添加标准圆角（与身份证实物一致，3.18mm）
+            front_resized = self.apply_rounded_corners(front_resized)
+            back_resized = self.apply_rounded_corners(back_resized)
 
             # 创建A4白色背景
             a4_image = np.ones((a4_height, a4_width, 3), dtype=np.uint8) * 255
@@ -641,7 +688,8 @@ class IDCardScanner(QMainWindow):
 
                 # 保存为PDF
                 img_bytes = BytesIO()
-                pil_image.save(img_bytes, format='PNG')
+                # 写入300DPI元数据，确保img2pdf生成精确A4（210x297mm）页面
+                pil_image.save(img_bytes, format='PNG', dpi=(300, 300))
                 img_bytes.seek(0)
 
                 with open(save_path, 'wb') as f:

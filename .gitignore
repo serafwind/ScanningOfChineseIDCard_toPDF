@@ -46,3 +46,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# PyInstaller 打包产物与模型
+models/
+*.spec

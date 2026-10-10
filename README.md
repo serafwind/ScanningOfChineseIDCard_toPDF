@@ -89,10 +89,20 @@ pip install pyinstaller
 ### 打包命令
 
 ```bash
-pyinstaller --onefile --windowed --name "身份证扫描件生成器" main.py
+python build_exe.py
 ```
 
-打包完成后，可执行文件位于 `dist` 目录下。
+> 注意：请使用 `build_exe.py` 打包，不要直接调用 `pyinstaller` 命令。
+> 脚本内置了两个关键修复（详见 `build_exe.py` 内注释）：
+> 1. 依赖扫描与启动时强制 onnxruntime/rembg 先于 PyQt5 加载（否则 DLL 加载顺序冲突导致段错误）
+> 2. 打包 pymatting 等包的版本元数据（缺失会导致启动时报 `PackageNotFoundError`）
+>
+> 如需离线使用背景消除功能，打包前把 `u2net.onnx` 放到 `models/u2net/` 目录（约 176MB，
+> 首次使用 rembg 时也会自动下载到 `~/.rembg/models/u2net/`），脚本会将其内置到 exe 中。
+
+打包完成后，可执行文件位于 `dist` 目录下。单文件 exe 可直接拷贝到任意 x86_64 的
+Windows 10/11 机器运行（无需安装 Python）；因未签名，首次运行需在 SmartScreen
+提示中选择「更多信息 → 仍要运行」。
 
 ## 系统要求
 
@@ -144,6 +154,15 @@ pyinstaller --onefile --windowed --name "身份证扫描件生成器" main.py
 - 尝试重新安装依赖：`pip install -r requirements.txt --force-reinstall`
 
 ## 版本历史
+
+### v1.1.0 (2026-10)
+- 修复：PNG 未写 DPI 元数据导致生成的 PDF 页面为 656×928mm，现为精确 A4（210×297mm）
+- 修复：rembg 新版 API 适配（`remove(model_name=...)` 已废弃，改用 session 并缓存复用，避免每次重复加载模型）
+- 修复：rembg/onnxruntime 与 PyQt5 的导入顺序冲突导致的启动段错误
+- 新增：卡片标准圆角（3.18mm，4 倍超采样抗锯齿），与实物一致
+- 新增：按游标卡尺实测尺寸输出（85.45mm × 53.95mm @300DPI）
+- 新增：「打印尺寸补偿」选项，抵消打印机"适合可打印区域"约 0.96 的缩放，打印后与实物等大
+- 新增：`build_exe.py` 一键打包为单文件 exe（含启动预加载钩子 `rthook_preload.py`、元数据收集、离线模型内置）
 
 ### v1.0.0 (2024)
 - 初始版本发布
